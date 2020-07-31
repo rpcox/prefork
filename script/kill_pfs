@@ -1,0 +1,11 @@
+
+ppid=$(ps -ef | grep -P 'perl .?/?pfs' | grep -v grep | awk '{printf "%d\t%d\n", $2, $3}' | grep -P '\t1' | cut -f 1)
+
+
+if [ -z $ppid ]; then
+ echo "PFS is not running"
+else
+  echo "PPID[$ppid] killed"
+  kill -SIGTERM $ppid
+  ps -ef | grep 'perl \.?\/?pfs' | grep -v grep
+fi

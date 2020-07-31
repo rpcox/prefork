@@ -1,0 +1,4 @@
+#
+export PFS_CONFIG=path/to/pfs.yaml
+export PFS_LOG=path/to/pfs.log.conf
+export PFS_TOKEN=path/to/token.db

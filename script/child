@@ -1,0 +1,23 @@
+
+ppid=$(ps -ef | grep -P 'perl .?/?pfs' | grep -v grep | awk '{printf "%d\t%d\n", $2, $3}' | grep -P '\t1' | cut -f 1)
+
+if [ -z $ppid ]; then
+  echo "PFS is not running"
+  exit
+fi
+
+if [ -z $1 ]; then
+  echo "usage: child add|drop"
+  exit
+fi
+
+case $1 in
+
+  add) kill -SIGUSR1 $ppid
+    ;;
+  drop) kill -SIGUSR2 $ppid
+    ;;
+    *) echo "usage: child add|drop"
+    ;;
+
+esac

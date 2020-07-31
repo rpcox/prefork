@@ -1,0 +1,675 @@
+#!/usr/bin/perl
+#
+#
+use 5.014;
+use IO::Socket;
+use JSON;
+use Log::Log4perl;
+use POSIX qw/ :signal_h :errno_h :sys_wait_h sitrftime /;
+use URI::Split qw/ uri_split /;
+use YAML::XS qw/ LoadFile /;
+
+# -----------------------------------------------------------------------------------
+my $version = '1.0';
+my $tool    = 'pfs';
+my $is_parent    = 1;         # process = ($is_parent= 1} ? parent : child
+my $parent_should_exit  = 0;  # $parent_should_exit = 1 if time for parent to exit
+my $child_should_exit   = 0;  # $child_should_exit = 1 if time for child to exit
+my $config;                   # reference to all configuration data
+my $rs;                       # reference for rest server socket
+
+my %child = (                 # child management
+  count => 0,
+    max => 0,
+    pid => {},
+);
+
+
+# --------------------------------------------
+# SIGUSR1
+#
+# Inform the parent to increase the number of $child{max} by one
+# and create a new child process
+#
+# > kill -SIGUSR1 PID
+
+sub SIG_USR1 {
+  my $log = Log::Log4perl->get_logger();
+
+  $child{max}++;
+  $log->trace('increment: child_max='.$child{max});
+  create_child();
+  $SIG{USR1} = \&SIG_USR1;
+}
+
+# --------------------------------------------
+# SIGUSR2
+#
+# Inform the parent decrease the number of $child{max} by one
+# and kill one child process
+#
+# > kill -SIGUSR2 PID
+
+sub SIG_USR2 {
+  my $log = Log::Log4perl->get_logger();
+
+  if ( $child{max} > 1 ) {
+    $child{max}--;
+    my $pid = ( keys %{$child{pid}} )[0];
+    if ( $log->is_trace ) {
+      $log->trace('decrement: child_max='.$child{max});
+      $log->trace('SIGINT -> PID['.$pid.']');
+    }
+    kill 'INT' => $pid;
+  }
+
+  $SIG{USR2} = \&SIG_USR2;
+}
+
+# --------------------------------------------
+# SIGINT
+#
+# Inform the parent or a child that it's time to exit and they will at the
+# next opportunity.
+#
+# kill -SIGINT PID
+
+sub SIG_INT {
+  my $log = Log::Log4perl->get_logger();
+
+  if ( $is_parent) {
+    $log->debug('SIGINT -> parent');
+    $parent_should_exit = 1;
+  }
+  else {
+    $log->debug('SIGINT -> child['.$$.']');
+    $child_should_exit = 1;
+  }
+
+  $SIG{INT}  = \&SIG_INT;
+}
+
+# --------------------------------------------
+# SIGTERM => if directed to parent, the parent will kill all children and
+# exit itself.  If directed to the child, the child will just exit.
+#
+# > kill -SIGTERM PID
+
+sub SIG_TERM {
+  my $log = Log::Log4perl->get_logger();
+
+  if ( $is_parent) {
+    $log->debug('SIGTERM -> parent');
+    kill 'TERM' => keys %{$child{pid}};
+    $parent_should_exit = 1;
+  }
+  else {
+    $log->debug('SIGTERM child['.$$.']');
+    exit;
+  }
+
+  $SIG{TERM}  = \&SIG_TERM;
+}
+
+# --------------------------------------------
+# SIGCHLD => child reaper
+#
+
+sub SIG_CHLD {
+  my $log = Log::Log4perl->get_logger();
+  local ($!, $?);
+
+  while ( my $pid = waitpid( 0, WNOHANG ) > 0 ) {
+
+    if ( WIFEXITED($?) ) {
+      $log->trace('SIGCHLD child['.$$.'] exit status: '. ($? >> 8));
+      $child{count}--;
+      delete $child{pid}{$pid};
+      last;
+    }
+    elsif ( $pid == -1 ) {
+      $log->trace('SIGCHLD child['.$$.'] error: waitpid returned -1');
+    }
+    else {
+      $log->trace('SIGCHLD child['.$$.'] no state change: waitpid returned 0');
+    }
+
+  };
+
+  $SIG{CHLD} = \&SIG_CHLD;
+}
+
+# --------------------------------------------
+
+sub version {
+  say $tool . ' -  v_' . $version;
+}
+
+# --------------------------------------------
+
+sub log_versions {
+  my $log = Log::Log4perl->get_logger();
+  $log->info('Getopt::Long '.$Getopt::Long::VERSION);
+  $log->info('IO::Socket::INET '.$IO::Socket::VERSION);
+  $log->info('JSON'.$JSON::VERSION);
+  $log->info('Log::Log4perl '.$Log::Log4perl::VERSION);
+  $log->info('POSIX '. $POSIX::VERSION);
+}
+
+# --------------------------------------------
+
+sub http_date {
+   return (strftime('%FT%TZ', gmtime(time)));
+}
+
+# --------------------------------------------
+
+sub usage {
+  my ($code, $msg) = @_;
+
+  if ( $msh ) {
+    print STDERR $msg . " : try $tool -h for usage\n";
+    exit($code);
+  }
+
+  print <<'EOM';
+
+  NAME
+
+    pfs - Pre-Forking REST API Server frame
+
+  SYNOPSIS
+
+    pfs  --config FILE
+    pfs  --version | --help
+
+  DESCRIPTION
+   -c, --config
+   -h, --help      Display this usage text
+   -v, --version   Print the version number
+
+EOM
+
+  exit(0);
+}
+
+# --------------------------------------------
+
+sub bonum {
+  my ( $ex, $msg, $code ) = @_;
+
+  $ex->{res}{content}{status}  = 'ok';
+  $ex->{res}{content}{message} = $msg;
+  $ex->{res}{code} = $code;
+  return 1;
+}
+# --------------------------------------------
+
+sub malus {
+  my ( $ex, $msg, $code ) = @_;
+
+  $ex->{res}{content}{status}  = 'not_ok';
+  $ex->{res}{content}{message} = $msg;
+  $ex->{res}{code} = $code;
+  return 0;
+}
+
+# --------------------------------------------
+
+sub get_command_line ($) {
+  my ( $opt ) = @_;
+
+  use Getopt::Long;
+
+  GetOptions(
+    "c|config=s" => \$opt->{config},
+    "h|help"     => \$opt->{help},
+    "v|version"  => \$opt->{version},
+  );
+
+  version and exit if ( $opt->{version} );
+  usage(0,'') if ( $opt->{help} );
+  usage(1,'--config is required') unless $opt->{config};
+}
+
+# --------------------------------------------
+
+sub log_line {
+  my $ex = shift;
+  return sprintf( '%s %s %s %s %s %s',
+                  $ex->{log}{ip},
+                  $ex->{log}{req},
+                  $ex->{res}{code},
+                  $ex->{log}{rx},
+                  $ex->{log}{tx},
+                );
+}
+
+# --------------------------------------------
+
+sub valid_api_method {
+  my $ex = shift;
+
+  return 1 if ( $ex->{req}{method} =~ /(?:api|auth|echo)/ );
+  return 0;
+}
+
+# --------------------------------------------
+
+sub valid_query {
+  my $ex = shift;
+
+  for ( qw/ f1 f2 f3 / ) {
+    return 1 if ( $ex->{req}{query} =~ /^$_=\w+/ );
+  }
+
+  return 0;
+}
+
+# --------------------------------------------
+
+my $execute = {
+
+  DELETE => sub {
+    my $ex = shift;
+    return malus($ex, 'DELETE not supported', 405);
+  },
+
+  GET => sub {
+    my $ex = shift;
+
+    if ( $ex->{req}{method} =~ /api/ ) {
+      if ( valid_query($ex) ) {
+        return bonum($ex, $ex->{req}{query}.' was executed', 200);
+      }
+      else {
+        return malus($ex, $ex->{req}{query}.' is an invalid query', 400);
+      }
+    }
+
+    return bonum($ex, 'echo', 200) if $ex->{req}{method} =~ /echo/;
+    return bonum($ex, 'authorized', 200) if $ex->{req}{method} =~ /auth/;
+  },
+
+  HEAD => sub {
+    my $ex = shift;
+    return bonum($ex, 'head', 200);
+    return 1;
+  },
+
+  OPTIONS => sub {
+    my $ex = shift;
+    return malus($ex, 'OPTIONS not supported', 405);
+    return 0;
+  },
+
+  PATCH => sub {
+    my $ex = shift;
+    return malus($ex, 'PATCH not supported', 405);
+  },
+
+  POST => sub {
+    my $ex = shift;
+    return malus($ex, 'POST not supported', 405);
+  },
+
+  PROPFIND => sub {
+    my $ex = shift;
+    return malus($ex, 'PROPFIND not supported', 405);
+  },
+
+  PUT => sub {
+    my $ex = shift;
+    return malus($ex, 'PUT not supported', 405);
+  },
+};
+
+
+# --------------------------------------------
+
+sub rbuf_parse {
+  my $ex = shift;
+
+  $ex->{res}{content}{status}  = 'ok';
+  $ex->{res}{content}{message} = '';
+  $ex->{res}{content}{data}    = '';
+
+  my @header = split /\r\n/, $ex->{rbuf};
+  my $line = shift @header;
+  $ex->{log}{req} = "\"$line\"";
+
+  # IF looking for a Bearer token
+  #for ( @header ) {
+  #  if ( /$Bearer: (.*)/ ) {
+  #    $ex->{token} = $1;
+  #  }
+  #}
+
+  my $tmp;
+
+  # $line = GET /api/vX/method?field1=param1&field2=param2... HTTP/1.1
+  if ( $line  =~ /(\w+)\s+(.*)\s+(HTTP\/[\d\.]+)/ ) {
+     ($ex->{req}{verb}, $ex->{req}{uri}, $ex->{req}{proto} ) = ( $1, $2, $3 );
+
+    ( $ex->{path}, $$ex->{method} ) = (uri_split($ex->{url}))[2,3];
+    $ex->{path} =~ /api\/v(\d+)\/(.*)/;
+    ( $ex->{version}, $ex->{method} ) = ( $1, $2 );
+
+    malus_response($ex, 'not current API version', 400) and return 0
+      unless ( $ex->{version} == $api_version );
+
+    ( $ex->{query}, $ex->{sub_query} ) = split /&/, $tmp;
+    return 1;
+  }
+  # $line = GET /api/vX/echo
+  elsif ( $line =~ /\w+\s+\/api\/v(.*)\/echo\s+HTTP\/\d\.\d/ ) {
+    malus_response($ex, 'not current API version', 400) and return 0
+      unless ( $api_version == $1 );
+    $ex->{method} = 'echo';
+    return 1
+  }
+  else {
+    malus_response($ex, 'not current API version', 400) and return 0
+      unless ( $api_version == $1 );
+    return 0
+  }
+
+  return 1;
+}
+
+# --------------------------------------------
+
+sub authorized {
+  my $ex = shift;
+
+  return $token_db{$ex->{token}};
+}
+
+# --------------------------------------------
+
+my %http_response = (
+  200 => '200 OK',
+  204 => '204 No Content',
+  400 => '400 Bad Request',
+  401 => '401 Unauthorized',
+  404 => '404 Not Found',
+  405 => '405 Method Not Allowed',
+  413 => '413 Request Entity Too Large',
+  500 => '500 Internal Server Error',
+  501 => '501 Not Implemented',
+  503 => '503 Service Unavailable',
+  505 => '505 HTTP Version Not Supported',
+);
+
+sub write_header {
+  my $ex = shift;
+
+  $ex->{log}{date} = http_date;
+
+  return  'HTTP/1.1 ' . $http_response{$ex->{res}{code}} . "\r\n" .
+          'Date: ' . $ex->{log}{date} . "\r\n" .
+          #'Server: ' . $tool .'/'. $version ."\r\n" .
+          'Content-Type: application/json; charset=UTF-8' . "\r\n" .
+          'Content-Length: ' . $ex->{log}{tx} . "\r\n\r\n";
+}
+
+# --------------------------------------------
+
+sub encode_send_close {
+  my ( $client, $ex ) = @_;
+
+  my $content = encode_json($ex->{res}{content});
+  $ex->{log}{tx} = length($content);
+  $client->send(write_header($ex) . $content);
+  close $client;
+}
+
+# --------------------------------------------
+
+sub create_child {
+  my ( $pid, $sigset );
+
+  $sigset = POSIX::SigSet->new( &POSIX::SIGINT );# block signal for fork
+  sigprocmask(&POSIX::SIG_BLOCK, $sigset);       # see => man sigprocmask
+
+  $pid = fork;
+  return undef unless defined $pid;              # let the parent return
+
+  if ( $pid ) {                                  # this is the parent
+    sigprocmask(&POSIX::SIG_UNBLOCK, $sigset) or exit;
+    $child{pid}{$pid} = 1;                       # add child PID to list
+    $child{count}++;                             # increment child count
+    return $pid;                                 # return the child pid
+  } else {                                       # else, this is the child
+    $is_parent= 0;
+    $SIG{INT} = 'DEFAULT';                       # make SIGINT kill as it could before
+
+    sigprocmask(&POSIX::SIG_UNBLOCK, $sigset) or exit;  # unblock signals
+    $SIG{CHLD} = \&SIG_CHLD;
+    $SIG{HUP}  = 'IGNORE';
+    $SIG{INT}  = \&SIG_INT;
+    $SIG{TERM} = \&SIG_TERM;
+    $SIG{USR1} = 'IGNORE';    # children can't create children
+    $SIG{USR2} = 'IGNORE';    # children can't force other children to exit
+
+    my $log = Log::Log4perl->get_logger();
+    $log->info('new child '.$$);
+    my $ex = {};
+
+      $log->debug('accept '.$$);
+      sleep;
+    while(my $client = $rs->accept()) {
+      $log->debug('accepted '.$$);
+
+      $client->recv($ex->{rbuf}, 1024);
+      $ex->{log}{ip} = $client->peerhost();
+      $ex->{log}{rx} = length $ex->{rbuf};
+
+      $log->debug('2');
+      if ( $child_should_exit ) {
+        malus($ex, 'service unavailable', 503);
+        encode_send_close($client, $ex);
+        last
+      }
+
+      unless (rbuf_parse($ex) ) {
+        malus($ex, 'header parse fail', 400);
+        encode_send_close($client, $ex);
+	$log->info(log_line($ex));
+        next
+      }
+
+      unless ( authorized($ex) ) {
+        malus($ex, 'authorization required', 401);
+        encode_send_close($client, $ex);
+	$log->info(log_line($ex));
+	next
+      }
+
+      unless ( valid_api_method($ex) ) {
+        malus($ex, 'invalid API method', 400);
+        encode_send_close($client, $ex);
+	$log->info(log_line($ex));
+	next
+      }
+
+      if ( $execute->{$ex->{req}{verb}}->($ex)) {
+        encode_send_close($client, $ex);
+      }
+      else {
+        encode_send_close($client, $ex);
+      }
+
+      $log->info(log_line($ex));
+      undef %{$ex};
+    }
+
+  # without this exit, the child will become a producer of more and more
+  # children, forking into process death consuming all of the system
+  # resources.
+
+  exit;                                          # No touchy touchy
+  }
+}
+
+# --------------------------------------------
+
+sub initialize {
+  my $sub = (caller(0))[3];
+
+  $config = LoadFile(shift);
+
+  say STDERR 'config file load failed' and exit 100
+    unless $config;
+
+  $child{max} = $config->{rest}{child_max};
+
+  open (my $fh, '<', $ENV{$config->{tokens}});
+  say STDERR $sub.' : failed to open token.db:'." $!" and exit 102
+    unless $fh;
+
+  my ( $c, $l) = ( 0, 0 );
+  while (<$fh>) {
+    $l++;
+    if ( /^(pfs).*/ ) {
+      $token_db{$1} = 1;
+      #say $l;
+      $c++;
+    }
+  }
+
+  Log::Log4perl->init($ENV{$config->{log}});
+  $Log::Log4perl::DateFormat::GMTIME = 1;  # log with UTC +0
+  my $log = Log::Log4perl->get_logger();
+  say STDERR $sub.' : logger init failed' and exit 103
+    unless $log;
+
+  $log->info('logger initialized. level = '. ($log->is_trace ? 'trace' :
+                                             ($log->is_debug ? 'debug' :
+                                              $log->is_info  ? 'info'  : 'unknown')));
+
+  $log->info('only loaded '.$c.' of '.$l.'tokens') and exit 104
+    unless ( $c );
+
+  $log->info('token load: '.$c.' of '.$l.' tokens');
+}
+
+# --------------------------------------------
+
+sub runas {
+  my $user;
+
+  if ( $< == 0 ) {
+    $user = $config->{rest}{runas};
+    POSIX::setuid((getpwnam( $user ))[2]);       # get the uid
+    POSIX::setgid((getpwnam( $user ))[3]);       # get the gid
+  }
+
+    my $log = Log::Log4perl::get_logger;
+    $log->info('runas '.$ENV{USER});
+}
+
+# --------------------------------------------
+
+sub start_rest {
+  my $h = shift;
+
+  my $log = Log::Log4perl->get_logger();
+
+  $rs = new IO::Socket::INET(LocalHost => $h->{LocalHost},
+                             LocalPort => $h->{LocalPort},
+		                 Proto => $h->{Proto},
+		                Listen => $h->{Listen},
+			     ReuseAddr => $h->{ReuseAddr},);
+
+  $log->fatal('failed to initialize REST server') and exit
+    unless $rs;
+
+  $log->info('REST server initialized');
+}
+
+# --------------------------------------------
+
+sub main () {
+
+  my %opt;
+  get_command_line(\%opt);
+
+  initialize($opt{config});
+  runas if ( $< == 0 );
+  my $log = Log::Log4perl->get_logger();
+  runas;
+
+  my $pid = fork;                    # Same as fork(2)
+  # There are three possible returns.
+  # 1) $pid = undef.  The fork call failed.
+  # 2) $pid = N.  The parent will receive the PID of the child process.  In
+  #    this program we don't want this parent hanging around and will force
+  #    it to exit on a successful call to fork.
+  # 3) $pid = 0.  The child will receive 0 (because it's not the parent)
+  #
+  $log->fatal('fork failed') and exit 2 if ( ! defined $pid );
+  exit if ( $pid != 0);              # Force the launch parent exit
+                                     # From here we are in the child process
+  my $ppid = $$;                     # Only needed to annotate logs
+  $log->info('parent @ ['.$ppid.']');
+
+  my $sess_id = POSIX::setsid();     # Same as setsid(2)
+  open (STDIN,  '<', '/dev/null');   # Close up the I/O. gO dAeMoN
+  open (STDOUT, '>', '/dev/null');
+  open (STDERR, '>', '/dev/null');
+
+  start_rest($config->{rest}{server});
+  $log->info(ref $rs);
+
+  $SIG{CHLD} = \&SIG_CHLD;
+  $SIG{HUP}  = 'IGNORE';
+  $SIG{INT}  = \&SIG_INT;
+  $SIG{TERM} = \&SIG_TERM;
+  $SIG{USR1} = \&SIG_USR1;
+  $SIG{USR2} = \&SIG_USR2;
+
+  my $attempts = 1;
+
+  $log->debug('initial child creation') ;
+  for my $i ( 1 .. $child{max} ) {
+    $log->info($i);
+    #   my $pid = create_child();
+    #$log->info('new child['.$pid.']');
+    unless ( create_child ) {
+      $log->info('failed to create child.  attempts : '. $attempts) ;
+      last if ( $attempts > 1 );
+      $attempts++;
+    }
+  }
+
+  while ( 1 ) {
+    $log->info('sleep');
+    sleep;                                       # wait for a signal
+
+    if ( $parent_should_exit ) {
+      for my $pid ( sort { $a <=> $b } keys %{$child{pid}} ) {
+        $log->info( 'term '. $pid );
+        kill 'TERM', $pid;
+      }
+
+      $log->info( 'parent exiting' );
+      last
+    }
+
+    # check the child count and create new ones if needed
+    for ( my $i = $child{count}; $i < $child{max}; $i++ ) {
+      $log->info( 'attempt to create a child failed')
+       unless ( create_child() );
+    }
+  }
+
+  $log->debug( 'parent closed' );
+  close ( $rs );
+}
+
+# -----------------------------------------------------------------------------------
+# main entry
+# -----------------------------------------------------------------------------------
+
+main;

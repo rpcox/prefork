@@ -1,0 +1,14 @@
+rest:
+  runas: nobody
+  child_max: 3
+  server:
+# using IO::Socket::INET
+    LocalHost: 192.168.1.94
+    LocalPort: 3000
+    Proto: tcp
+    Listen: 5
+    ReuseAddr: SO_REUSEADDR
+#
+# Environment variables to find the logging config and the user tokens
+#
+log: P5PFS_LOG
